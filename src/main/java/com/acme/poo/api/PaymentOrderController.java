@@ -10,16 +10,24 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
+import org.apache.camel.ProducerTemplate;
+
 @RestController
 @RequestMapping("/payment-orders")
 public class PaymentOrderController {
 
     private final PaymentOrderRepository orderRepo;
     private final IdempotencyRecordRepository idemRepo;
+    private final ProducerTemplate producerTemplate;
 
-    public PaymentOrderController(PaymentOrderRepository orderRepo, IdempotencyRecordRepository idemRepo) {
+    public PaymentOrderController(
+            PaymentOrderRepository orderRepo,
+            IdempotencyRecordRepository idemRepo,
+            ProducerTemplate producerTemplate
+    ) {
         this.orderRepo = orderRepo;
         this.idemRepo = idemRepo;
+        this.producerTemplate = producerTemplate;
     }
 
     @PostMapping
@@ -52,11 +60,14 @@ public class PaymentOrderController {
         orderRepo.save(order);
         idemRepo.save(new IdempotencyRecord(idempotencyKey, id));
 
-        return new CreatePaymentOrderResponse(id, order.getStatus());
+        // hand-off to Camel
+        producerTemplate.sendBody("direct:processPaymentOrder", order);producerTemplate.sendBody("direct:processPaymentOrder", order);
+
+        return new CreatePaymentOrderResponse(id, PaymentOrderStatus.RECEIVED);
     }
 
     @GetMapping("/{id}")
-    public GetPaymentOrderResponse get(@PathVariable String id) {
+    public GetPaymentOrderResponse get(@PathVariable("id") String id) {
         PaymentOrder order = orderRepo.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Payment order not found"));
 
