@@ -91,8 +91,6 @@ public class PaymentOrderRoute extends RouteBuilder {
                 + "&valueDeserializer=org.apache.kafka.common.serialization.StringDeserializer")
                 .routeId("payment-order-execution")
                 .log("Executor received payment order ${body}")
-                // Artificial delay to observe async behavior (e.g., 30 seconds)
-                .delay(30000)
                 .process(exchange -> {
                     String paymentOrderId = exchange.getMessage().getBody(String.class);
 
