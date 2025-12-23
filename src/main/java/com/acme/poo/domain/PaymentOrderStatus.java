@@ -5,5 +5,6 @@ public enum PaymentOrderStatus {
     VALIDATED,
     ACCEPTED,
     EXECUTING,
-    EXECUTED
+    EXECUTED,
+    FAILED
 }

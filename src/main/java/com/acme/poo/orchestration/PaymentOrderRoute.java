@@ -9,6 +9,9 @@ import org.springframework.stereotype.Component;
 @Component
 public class PaymentOrderRoute extends RouteBuilder {
 
+    private static final String EXECUTE_TOPIC = "payment.execute";
+    private static final String DLT_TOPIC = "payment.execute.dlt";
+
     private final PaymentOrderRepository repository;
 
     public PaymentOrderRoute(PaymentOrderRepository repository) {
@@ -19,6 +22,39 @@ public class PaymentOrderRoute extends RouteBuilder {
     public void configure() {
 
         /* =========================================================
+           GLOBAL ERROR HANDLING (Retries + DLT + FAILED state)
+           ========================================================= */
+
+        onException(Exception.class)
+                .handled(true)
+                .maximumRedeliveries(5)
+                .redeliveryDelay(1000)
+                .backOffMultiplier(2.0)
+                .useExponentialBackOff()
+                .log("Execution failed for ${body}. Marking FAILED and sending to DLT. Error: ${exception.message}")
+
+                // Mark order as FAILED
+                .process(exchange -> {
+                    String id = exchange.getMessage().getBody(String.class);
+                    repository.findById(id).ifPresent(order -> {
+                        PaymentOrder failed = new PaymentOrder(
+                                order.getId(),
+                                order.getDebtorAccount(),
+                                order.getCreditorAccount(),
+                                order.getAmount(),
+                                order.getCurrency(),
+                                PaymentOrderStatus.FAILED
+                        );
+                        repository.save(failed);
+                    });
+                })
+
+                // Send to Dead Letter Topic
+                .to("kafka:" + DLT_TOPIC
+                        + "?brokers=localhost:9092"
+                        + "&valueSerializer=org.apache.kafka.common.serialization.StringSerializer");
+
+        /* =========================================================
            PAYMENT ORCHESTRATION (HTTP → Camel → Mongo → Kafka)
            ========================================================= */
 
@@ -26,78 +62,66 @@ public class PaymentOrderRoute extends RouteBuilder {
                 .routeId("payment-order-processing")
                 .log("Processing payment order ${body.id}")
 
-                // -------- VALIDATED --------
-                .process(exchange -> {
-                    PaymentOrder o = exchange.getMessage().getBody(PaymentOrder.class);
+                // VALIDATED
+                .process(e -> {
+                    PaymentOrder o = e.getMessage().getBody(PaymentOrder.class);
                     PaymentOrder updated = new PaymentOrder(
-                            o.getId(),
-                            o.getDebtorAccount(),
-                            o.getCreditorAccount(),
-                            o.getAmount(),
-                            o.getCurrency(),
-                            PaymentOrderStatus.VALIDATED
+                            o.getId(), o.getDebtorAccount(), o.getCreditorAccount(),
+                            o.getAmount(), o.getCurrency(), PaymentOrderStatus.VALIDATED
                     );
                     repository.save(updated);
-                    exchange.getMessage().setBody(updated);
+                    e.getMessage().setBody(updated);
                 })
                 .log("Payment order ${body.id} validated")
 
-                // -------- ACCEPTED --------
-                .process(exchange -> {
-                    PaymentOrder o = exchange.getMessage().getBody(PaymentOrder.class);
+                // ACCEPTED
+                .process(e -> {
+                    PaymentOrder o = e.getMessage().getBody(PaymentOrder.class);
                     PaymentOrder updated = new PaymentOrder(
-                            o.getId(),
-                            o.getDebtorAccount(),
-                            o.getCreditorAccount(),
-                            o.getAmount(),
-                            o.getCurrency(),
-                            PaymentOrderStatus.ACCEPTED
+                            o.getId(), o.getDebtorAccount(), o.getCreditorAccount(),
+                            o.getAmount(), o.getCurrency(), PaymentOrderStatus.ACCEPTED
                     );
                     repository.save(updated);
-                    exchange.getMessage().setBody(updated);
+                    e.getMessage().setBody(updated);
                 })
                 .log("Payment order ${body.id} accepted")
 
-                // -------- EXECUTING + SEND TO KAFKA --------
-                .process(exchange -> {
-                    PaymentOrder o = exchange.getMessage().getBody(PaymentOrder.class);
+                // EXECUTING + SEND TO KAFKA
+                .process(e -> {
+                    PaymentOrder o = e.getMessage().getBody(PaymentOrder.class);
                     PaymentOrder updated = new PaymentOrder(
-                            o.getId(),
-                            o.getDebtorAccount(),
-                            o.getCreditorAccount(),
-                            o.getAmount(),
-                            o.getCurrency(),
-                            PaymentOrderStatus.EXECUTING
+                            o.getId(), o.getDebtorAccount(), o.getCreditorAccount(),
+                            o.getAmount(), o.getCurrency(), PaymentOrderStatus.EXECUTING
                     );
                     repository.save(updated);
-
-                    // Send only the orderId to Kafka (String)
-                    exchange.getMessage().setBody(updated.getId());
+                    e.getMessage().setBody(updated.getId()); // Kafka payload = orderId
                 })
-                .to("kafka:payment.execute"
+                .to("kafka:" + EXECUTE_TOPIC
                         + "?brokers=localhost:9092"
                         + "&valueSerializer=org.apache.kafka.common.serialization.StringSerializer")
                 .log("Payment order ${body} sent for execution");
-
 
         /* =========================================================
            PAYMENT EXECUTION (Kafka → Camel → Mongo)
            ========================================================= */
 
-        from("kafka:payment.execute"
+        from("kafka:" + EXECUTE_TOPIC
                 + "?brokers=localhost:9092"
                 + "&groupId=payment-executor"
                 + "&autoOffsetReset=earliest"
                 + "&valueDeserializer=org.apache.kafka.common.serialization.StringDeserializer")
                 .routeId("payment-order-execution")
                 .log("Executor received payment order ${body}")
-                .process(exchange -> {
-                    String paymentOrderId = exchange.getMessage().getBody(String.class);
 
-                    PaymentOrder order = repository.findById(paymentOrderId).orElse(null);
-                    if (order == null) {
-                        return;
-                    }
+                // Optional delay for demo/testing
+                // .delay(30000)
+                // Simulating a failure
+                // .throwException(new RuntimeException("Simulated execution failure"))
+
+                .process(e -> {
+                    String id = e.getMessage().getBody(String.class);
+                    PaymentOrder order = repository.findById(id)
+                            .orElseThrow(() -> new IllegalStateException("Order not found: " + id));
 
                     PaymentOrder executed = new PaymentOrder(
                             order.getId(),
@@ -111,5 +135,17 @@ public class PaymentOrderRoute extends RouteBuilder {
                     repository.save(executed);
                 })
                 .log("Payment order ${body} marked EXECUTED");
+
+        /* =========================================================
+           DEAD LETTER TOPIC CONSUMER (Visibility only)
+           ========================================================= */
+
+        from("kafka:" + DLT_TOPIC
+                + "?brokers=localhost:9092"
+                + "&groupId=payment-executor-dlt"
+                + "&autoOffsetReset=earliest"
+                + "&valueDeserializer=org.apache.kafka.common.serialization.StringDeserializer")
+                .routeId("payment-order-dlt")
+                .log("DLT received payment order ${body} (manual intervention required)");
     }
 }
